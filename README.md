@@ -2,6 +2,9 @@
 
 [![Discord Server](https://discordapp.com/api/guilds/930499730843250783/widget.png?style=banner2)](https://discord.gg/Sx6Spmsgx7)
 
+## Documentation
+(Training Guide)[https://github.com/harubaru/waifu-diffusion/docs/en/README.md]
+
 All thanks goes to CompVis and Stability AI for releasing this codebase! Pretrained models coming soon...
 
 # Stable Diffusion
