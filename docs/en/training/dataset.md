@@ -38,15 +38,25 @@ apt install rsync
 ````
 #### Windows
 On Windows, you are going to need to install Cygwin, a posix runtime for Windows which allows the usage of many linux-only programs inside windows.
+
 [Cygwin Installer for x86](https://www.cygwin.com/setup-x86_64.exe)
+
 On the installer, select mirrors.kernel.org for Download Site:
-![[cygwin-mirrors.png]]
+
+![cygwin-mirrors.png](./res/cygwin-mirrors.png)
+
 Next, search for "rsync" on the search bar, change "View: Pending" to "View: Full", and select on the "New" tab the latest version. Do the same for "zip".
-![[cygwin-packages.png]]
+
+![cygwin-packages.png](./res/cygwin-packages.png)
+
 GIF explaining the entire process:
-![[cygwin-gif.gif]]
+
+![cygwin-gif.gif](./res/cygwin-gif.gif)
+
 Once the installation is finished, you should see "Cygwin64 Terminal" on your Start Menu. Launch it and you should be greated by the following window:
-![[cygwin-idle.png]]
+
+![cygwin-idle.png](./res/cygwin-idle.png)
+
 You may now follow the intructions
 
 ### Downloading the dataset
@@ -85,7 +95,7 @@ Change "/waifu-diffusion" to the path of the cloned waifu-diffusion repository.
 This script will also change some tags such as "1girl" to "one girl", "2boys" to "two boys", and so on. It will also add "upoaded on Danbooru".
 
 Once the script has finished, you should have a "labeled_data" folder, whose insides look like this:
-![[labeled_data-insides.png]]
+![labeled_data-insides.png](./res/labeled_data-insides.png)
 
 ## Packaging the dataset
 In order to reduce size, zip the contents of labeled_data:
