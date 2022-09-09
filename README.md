@@ -11,7 +11,7 @@ Waifu Diffusion is the name for this project of finetuning Stable Diffusion on D
 ## Documentation
 [Index](./docs/en/README.md)
 
-[Training Guide](https://github.com/harubaru/waifu-diffusion/blob/main/docs/en/training/README.md)
+[Training Guide](./docs/en/training/README.md)
 
 [Released Weights](./docs/en/weights/README.md)
 
