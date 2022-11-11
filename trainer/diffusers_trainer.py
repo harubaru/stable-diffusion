@@ -162,8 +162,14 @@ class ImageStore:
 
     def __valid_file(self, f) -> bool:
         try:
-            Image.open(f)
+            Image.open(f).load()
             return True
+        except OSError as error:
+            if 'truncated' in str(error):
+                print(f'WARNING: Truncated image: {f}')
+                return False
+            print(f'WARNING: Unable to open file: {f}')
+            return False
         except:
             print(f'WARNING: Unable to open file: {f}')
             return False
