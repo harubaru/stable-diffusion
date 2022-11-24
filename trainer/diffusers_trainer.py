@@ -23,6 +23,7 @@ import gc
 import time
 import itertools
 import numpy as np
+import math
 import json
 import re
 import traceback
@@ -60,6 +61,7 @@ parser.add_argument('--bucket_side_max', type=int, default=768, help='The maximu
 parser.add_argument('--lr', type=float, default=5e-6, help='Learning rate')
 parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
 parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of updates steps to accumulate before performing a backward/update pass.')
 parser.add_argument('--use_ema', type=bool_t, default='False', help='Use EMA for finetuning')
 parser.add_argument('--ucg', type=float, default=0.1, help='Percentage chance of dropping out the text condition per batch. Ranges from 0.0 to 1.0 where 1.0 means 100% text condition dropout.') # 10% dropout probability
 parser.add_argument('--gradient_checkpointing', dest='gradient_checkpointing', type=bool_t, default='False', help='Enable gradient checkpointing')
@@ -751,7 +753,7 @@ def main():
 
     print(get_gpu_ram())
 
-    num_steps_per_epoch = len(train_dataloader)
+    num_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     progress_bar = tqdm.tqdm(range(args.epochs * num_steps_per_epoch), desc="Total Steps", leave=False)
     global_step = 0
 
@@ -796,7 +798,7 @@ def main():
         loss = torch.tensor(0.0, device=device, dtype=weight_dtype)
         for epoch in range(args.epochs):
             unet.train()
-            for _, batch in enumerate(train_dataloader):
+            for idx, batch in enumerate(train_dataloader):
                 if args.resume and global_step < target_global_step:
                     if rank == 0:
                         progress_bar.update(1)
@@ -829,109 +831,113 @@ def main():
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
                 loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-
-                # Backprop and all reduce
+                
+                # Normalize the Gradients and backprop
+                loss = loss/args.gradient_accumulation_steps
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                
+                if ((idx + 1) % args.gradient_accumulation_steps == 0) or (idx + 1 == len(train_dataloader)):
+                    # Update Optimizer
+                    scaler.step(optimizer)
+                    scaler.update()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
-                # Update EMA
-                if args.use_ema:
-                    ema_unet.step(unet.parameters())
+                    # Update EMA
+                    if args.use_ema:
+                        ema_unet.step(unet.parameters())
 
-                # perf
-                b_end = time.perf_counter()
-                seconds_per_step = b_end - b_start
-                steps_per_second = 1 / seconds_per_step
-                rank_images_per_second = args.batch_size * steps_per_second
-                world_images_per_second = rank_images_per_second * world_size
-                samples_seen = global_step * args.batch_size * world_size
+                    # perf
+                    b_end = time.perf_counter()
+                    seconds_per_step = b_end - b_start
+                    steps_per_second = 1 / seconds_per_step
+                    rank_images_per_second = args.batch_size * steps_per_second
+                    world_images_per_second = rank_images_per_second * world_size
+                    samples_seen = global_step * args.batch_size * world_size
 
-                # All reduce loss
-                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+                    # All reduce loss
+                    torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
 
-                if rank == 0:
-                    progress_bar.update(1)
-                    global_step += 1
-                    logs = {
-                        "train/loss": loss.detach().item() / world_size,
-                        "train/lr": lr_scheduler.get_last_lr()[0],
-                        "train/epoch": epoch,
-                        "train/step": global_step,
-                        "train/samples_seen": samples_seen,
-                        "perf/rank_samples_per_second": rank_images_per_second,
-                        "perf/global_samples_per_second": world_images_per_second,
-                    }
-                    progress_bar.set_postfix(logs)
-                    run.log(logs, step=global_step)
+                    if rank == 0:
+                        progress_bar.update(1)
+                        global_step += 1
+                        logs = {
+                            "train/loss": loss.detach().item() / world_size,
+                            "train/lr": lr_scheduler.get_last_lr()[0],
+                            "train/epoch": epoch,
+                            "train/step": global_step,
+                            "train/samples_seen": samples_seen,
+                            "perf/rank_samples_per_second": rank_images_per_second,
+                            "perf/global_samples_per_second": world_images_per_second,
+                        }
+                        progress_bar.set_postfix(logs)
+                        run.log(logs, step=global_step)
 
-                if global_step % args.save_steps == 0:
-                    save_checkpoint(global_step)
+                    if global_step % args.save_steps == 0:
+                        save_checkpoint(global_step)
 
-                if args.enableinference:
-                    if global_step % args.image_log_steps == 0:
-                        if rank == 0:
-                            # get prompt from random batch
-                            prompt = tokenizer.decode(batch['input_ids'][random.randint(0, len(batch['input_ids'])-1)].tolist())
+                    if args.enableinference:
+                        if global_step % args.image_log_steps == 0:
+                            if rank == 0:
+                                # get prompt from random batch
+                                prompt = tokenizer.decode(batch['input_ids'][random.randint(0, len(batch['input_ids'])-1)].tolist())
 
-                            if args.image_log_scheduler == 'DDIMScheduler':
-                                print('using DDIMScheduler scheduler')
-                                scheduler = DDIMScheduler(
-                                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-                                )
-                            else:
-                                print('using PNDMScheduler scheduler')
-                                scheduler=PNDMScheduler(
-                                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
-                                )
+                                if args.image_log_scheduler == 'DDIMScheduler':
+                                    print('using DDIMScheduler scheduler')
+                                    scheduler = DDIMScheduler(
+                                        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
+                                    )
+                                else:
+                                    print('using PNDMScheduler scheduler')
+                                    scheduler=PNDMScheduler(
+                                        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
+                                    )
 
-                            pipeline = StableDiffusionPipeline(
-                                text_encoder=text_encoder,
-                                vae=vae,
-                                unet=unet,
-                                tokenizer=tokenizer,
-                                scheduler=scheduler,
-                                safety_checker=None, # disable safety checker to save memory
-                                feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
-                            ).to(device)
-                            # inference
-                            if args.enablewandb:
-                                images = []
-                            else:
-                                saveInferencePath = args.output_path + "/inference"
-                                os.makedirs(saveInferencePath, exist_ok=True)
-                            with torch.no_grad():
-                                with torch.autocast('cuda', enabled=args.fp16):
-                                    for _ in range(args.image_log_amount):
-                                        if args.enablewandb:
-                                            images.append(
-                                                wandb.Image(pipeline(
-                                                    prompt, num_inference_steps=args.image_log_inference_steps
-                                                ).images[0],
-                                                caption=prompt)
-                                            )
-                                        else:
-                                            from datetime import datetime
-                                            images = pipeline(prompt, num_inference_steps=args.image_log_inference_steps).images[0]
-                                            filenameImg = str(time.time_ns()) + ".png"
-                                            filenameTxt = str(time.time_ns()) + ".txt"
-                                            images.save(saveInferencePath + "/" + filenameImg)
-                                            with open(saveInferencePath + "/" + filenameTxt, 'a') as f:
-                                                f.write('Used prompt: ' + prompt + '\n')
-                                                f.write('Generated Image Filename: ' + filenameImg + '\n')
-                                                f.write('Generated at: ' + str(global_step) + ' steps' + '\n')
-                                                f.write('Generated at: ' + str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))+ '\n')
+                                pipeline = StableDiffusionPipeline(
+                                    text_encoder=text_encoder,
+                                    vae=vae,
+                                    unet=unet,
+                                    tokenizer=tokenizer,
+                                    scheduler=scheduler,
+                                    safety_checker=None, # disable safety checker to save memory
+                                    feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+                                ).to(device)
+                                # inference
+                                if args.enablewandb:
+                                    images = []
+                                else:
+                                    saveInferencePath = args.output_path + "/inference"
+                                    os.makedirs(saveInferencePath, exist_ok=True)
+                                with torch.no_grad():
+                                    with torch.autocast('cuda', enabled=args.fp16):
+                                        for _ in range(args.image_log_amount):
+                                            if args.enablewandb:
+                                                images.append(
+                                                    wandb.Image(pipeline(
+                                                        prompt, num_inference_steps=args.image_log_inference_steps
+                                                    ).images[0],
+                                                    caption=prompt)
+                                                )
+                                            else:
+                                                from datetime import datetime
+                                                images = pipeline(prompt, num_inference_steps=args.image_log_inference_steps).images[0]
+                                                filenameImg = str(time.time_ns()) + ".png"
+                                                filenameTxt = str(time.time_ns()) + ".txt"
+                                                images.save(saveInferencePath + "/" + filenameImg)
+                                                with open(saveInferencePath + "/" + filenameTxt, 'a') as f:
+                                                    f.write('Used prompt: ' + prompt + '\n')
+                                                    f.write('Generated Image Filename: ' + filenameImg + '\n')
+                                                    f.write('Generated at: ' + str(global_step) + ' steps' + '\n')
+                                                    f.write('Generated at: ' + str(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))+ '\n')
 
-                            # log images under single caption
-                            if args.enablewandb:
-                                run.log({'images': images}, step=global_step)
+                                # log images under single caption
+                                if args.enablewandb:
+                                    run.log({'images': images}, step=global_step)
 
-                            # cleanup so we don't run out of memory
-                            del pipeline
-                            gc.collect()
-                        torch.distributed.barrier()
+                                # cleanup so we don't run out of memory
+                                del pipeline
+                                gc.collect()
+                            torch.distributed.barrier()
     except Exception as e:
         print(f'Exception caught on rank {rank} at step {global_step}, saving checkpoint...\n{e}\n{traceback.format_exc()}')
         pass
