@@ -81,7 +81,7 @@ parser.add_argument('--fp16', dest='fp16', type=bool_t, default='False', help='T
 parser.add_argument('--image_log_steps', type=int, default=100, help='Number of steps to log images at.')
 parser.add_argument('--image_log_amount', type=int, default=4, help='Number of images to log every image_log_steps')
 parser.add_argument('--image_log_inference_steps', type=int, default=50, help='Number of inference steps to use to log images.')
-parser.add_argument('--image_log_scheduler', type=str, default="PNDMScheduler", help='Number of inference steps to use to log images.')
+parser.add_argument('--image_log_scheduler', type=str, default="DDIMScheduler", help='Scheduler to use during inference. PNDMScheduler OR DDPMScheduler')
 parser.add_argument('--clip_penultimate', type=bool_t, default='False', help='Use penultimate CLIP layer for text embedding')
 parser.add_argument('--output_bucket_info', type=bool_t, default='False', help='Outputs bucket information and exits')
 parser.add_argument('--resize', type=bool_t, default='False', help="Resizes dataset's images to the appropriate bucket dimensions.")
@@ -91,6 +91,7 @@ parser.add_argument('--inference', dest='enableinference', type=bool_t, default=
 parser.add_argument('--extended_validation', type=bool_t, default='False', help='Perform extended validation of images to catch truncated or corrupt images.')
 parser.add_argument('--no_migration', type=bool_t, default='False', help='Do not perform migration of dataset while the `--resize` flag is active. Migration creates an adjacent folder to the dataset with <dataset_dirname>_cropped.')
 parser.add_argument('--skip_validation', type=bool_t, default='False', help='Skip validation of images, useful for speeding up loading of very large datasets that have already been validated.')
+parser.add_argument('--v_prediction', type=bool_t, default='False', help='Force V-Prediction/V-Objective during inference & training. Recommended for SD 2.0, must be in included in the diffusers.')
 
 args = parser.parse_args()
 
@@ -654,6 +655,13 @@ def main():
             print("No HF Token detected in arguments or enviroment variable, setting it to none (as in string)")
             args.hf_token = "none"
 
+    if args.v_prediction:
+        #TODO: add version check for vers under v0.9.0
+        print("Warning, V_Prediction is currently only available on the github repository. If you installed diffusers via pip, uninstall it and reinstall it from the repository.")
+        if args.image_log_scheduler == "PNDMScheduler":
+            print("You cannot use V-Prediction on PNDMScheduler yet. Changing Image Log Scheduler to DDPMScheduler")
+            args.image_log_scheduler = "DDPMScheduler"
+
     device = torch.device('cuda')
 
     print("DEVICE:", device)
@@ -709,13 +717,16 @@ def main():
         weight_decay=args.adam_weight_decay,
     )
 
-    noise_scheduler = DDPMScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule='scaled_linear',
-        num_train_timesteps=1000,
-        clip_sample=False
-    )
+    if args.v_prediction:
+        noise_scheduler = DDPMScheduler.from_config(args.model, subfolder="scheduler", use_auth_token=args.hf_token)
+    else:
+        noise_scheduler = DDPMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule='scaled_linear',
+            num_train_timesteps=1000,
+            clip_sample=False
+        )
 
     # load dataset
     store = ImageStore(args.dataset)
@@ -824,11 +835,19 @@ def main():
                 else:
                     encoder_hidden_states = encoder_hidden_states.last_hidden_state
 
+                # Credits: HuggingFace Finetuner
+                # Get the target for loss depending on prediction type
+                # Works for PNDMS too as it will return epsilon. Currently only DDPMS supports v-prediction
+                if args.v_prediction is False:
+                    target = noise
+                elif args.v_prediction:
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+
                 # Predict the noise residual and compute loss
                 with torch.autocast('cuda', enabled=args.fp16):
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 # Backprop and all reduce
                 scaler.scale(loss).backward()
@@ -878,9 +897,17 @@ def main():
 
                             if args.image_log_scheduler == 'DDIMScheduler':
                                 print('using DDIMScheduler scheduler')
-                                scheduler = DDIMScheduler(
-                                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-                                )
+                                if args.v_prediction is False:
+                                    print("using Epsilon prediction type")
+                                    scheduler = DDIMScheduler(
+                                        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
+                                    )
+                                elif args.v_prediction:
+                                    print("using V_Prediction prediction type")
+                                    # according to https://github.com/huggingface/diffusers/blob/02aa4ef12e2ce0848a8bf5e36be667782f158a05/tests/pipelines/stable_diffusion_2/test_stable_diffusion_v_pred.py#L99
+                                    scheduler = DDIMScheduler(
+                                        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False, prediction_type="v_prediction",
+                                    )
                             else:
                                 print('using PNDMScheduler scheduler')
                                 scheduler=PNDMScheduler(
